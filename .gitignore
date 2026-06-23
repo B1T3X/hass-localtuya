@@ -3,4 +3,4 @@ __pycache__
 tuyadebug/
 .idea/
 .pre-commit-config.yaml
-.coverage
+.coveragesync-to-ha.sh
