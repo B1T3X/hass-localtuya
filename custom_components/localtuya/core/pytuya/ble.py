@@ -280,7 +280,9 @@ class TuyaBLEProtocol:
         self.device_uuid      = device_uuid
         self.protocol_version = protocol_version
 
-        # Key derivation
+        # Key derivation — Tuya's protocol uses only the first 6 chars of the local_key
+        # as key material, giving ~36 bits of entropy. This is Tuya's design; a nearby
+        # attacker with a BLE sniffer could brute-force the login_key offline.
         self._lk6        = local_key[:6].encode("utf-8")
         self._login_key  = md5(self._lk6).digest()
         self._session_key: bytes | None = None
@@ -511,9 +513,8 @@ class TuyaBLEProtocol:
             await self._client.write_gatt_char(TUYA_BLE_WRITE_UUID, pkt, response=True)
 
         try:
-            async with asyncio.timeout(timeout):
-                return await fut
-        except TimeoutError:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
             self._pending.pop(seq, None)
             raise
 

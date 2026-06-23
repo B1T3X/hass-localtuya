@@ -206,6 +206,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     if self._device_config.enable_debug:
                         self._interface.enable_debug(True, gateway.friendly_name)
                 elif self._device_config.ble_mac:
+                    if not self._device_config.tuya_uuid:
+                        _LOGGER.warning(
+                            "[%s] BLE device has no tuya_device_uuid configured — "
+                            "PAIR handshake will fail. Add 'tuya_device_uuid' to the device config.",
+                            self._device_config.id,
+                        )
                     self._interface = await pytuya_ble_connect(
                         self._device_config.ble_mac,
                         self._device_config.id,
