@@ -16,9 +16,14 @@ from .cipher import AESCipher
 _LOGGER = logging.getLogger(__name__)
 
 # ── GATT UUIDs ────────────────────────────────────────────────────────────────
-TUYA_BLE_SERVICE_UUID = "0000fd50-0000-1000-8000-00805f9b34fb"
-TUYA_BLE_WRITE_UUID   = "00000001-0000-1000-8000-00805f9b34fb"
-TUYA_BLE_NOTIFY_UUID  = "00000002-0000-1000-8000-00805f9b34fb"
+# Newer Tuya BLE-only devices (service 1910, confirmed on BLE smart plug)
+TUYA_BLE_SERVICE_UUID = "00001910-0000-1000-8000-00805f9b34fb"
+TUYA_BLE_WRITE_UUID   = "00002b11-0000-1000-8000-00805f9b34fb"
+TUYA_BLE_NOTIFY_UUID  = "00002b10-0000-1000-8000-00805f9b34fb"
+# Older provisioning profile (WiFi+BLE combo devices)
+TUYA_BLE_SERVICE_UUID_LEGACY = "0000fd50-0000-1000-8000-00805f9b34fb"
+TUYA_BLE_WRITE_UUID_LEGACY   = "00000001-0000-1000-8000-00805f9b34fb"
+TUYA_BLE_NOTIFY_UUID_LEGACY  = "00000002-0000-1000-8000-00805f9b34fb"
 
 # ── BLE commands ──────────────────────────────────────────────────────────────
 class BLECmd:
@@ -163,6 +168,8 @@ class TuyaBLEProtocol:
         self._cipher = AESCipher(ble_key)
 
         self._listener     = weakref.ref(listener)
+        self._write_uuid   = TUYA_BLE_WRITE_UUID
+        self._notify_uuid  = TUYA_BLE_NOTIFY_UUID
         self._client: BleakClient | None = None
         self._seqno        = 1
         self._connected    = False
@@ -240,19 +247,35 @@ class TuyaBLEProtocol:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _do_connect(self):
-        """Open BLE connection and start notify handler + heartbeat."""
+        """Open BLE connection, auto-detect UUID profile, start notify + heartbeat."""
         self._client = BleakClient(
             self.mac_address,
             disconnected_callback=self._on_disconnect,
         )
         await self._client.connect()
-        # Negotiate a larger MTU if possible (bleak handles this per-platform)
+
         try:
-            mtu = self._client.mtu_size
-            _LOGGER.debug("[%s] BLE MTU = %d", self._name, mtu)
+            _LOGGER.debug("[%s] BLE MTU = %d", self._name, self._client.mtu_size)
         except AttributeError:
             pass
-        await self._client.start_notify(TUYA_BLE_NOTIFY_UUID, self._on_notify)
+
+        # Auto-detect which GATT profile this device uses
+        service_uuids = [str(s.uuid) for s in self._client.services]
+        if TUYA_BLE_SERVICE_UUID in service_uuids:
+            self._write_uuid  = TUYA_BLE_WRITE_UUID
+            self._notify_uuid = TUYA_BLE_NOTIFY_UUID
+            _LOGGER.debug("[%s] Using Tuya BLE profile 1910", self._name)
+        elif TUYA_BLE_SERVICE_UUID_LEGACY in service_uuids:
+            self._write_uuid  = TUYA_BLE_WRITE_UUID_LEGACY
+            self._notify_uuid = TUYA_BLE_NOTIFY_UUID_LEGACY
+            _LOGGER.debug("[%s] Using Tuya BLE legacy profile fd50", self._name)
+        else:
+            raise ConnectionError(
+                f"No Tuya BLE service found on {self.mac_address}. "
+                f"Available: {service_uuids}"
+            )
+
+        await self._client.start_notify(self._notify_uuid, self._on_notify)
         self._connected = True
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         _LOGGER.debug("[%s] BLE connected to %s", self._name, self.mac_address)
@@ -351,7 +374,7 @@ class TuyaBLEProtocol:
 
         mtu = getattr(self._client, 'mtu_size', _BLE_MTU) or _BLE_MTU
         for i in range(0, len(packet), mtu):
-            await self._client.write_gatt_char(TUYA_BLE_WRITE_UUID, packet[i:i + mtu], response=False)
+            await self._client.write_gatt_char(self._write_uuid, packet[i:i + mtu], response=False)
 
         if self._debug:
             _LOGGER.debug("[%s] BLE → cmd=0x%02x seq=%d payload=%s", self._name, cmd, seq, payload.hex() if payload else '')
