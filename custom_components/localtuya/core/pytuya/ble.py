@@ -1,183 +1,301 @@
-"""Tuya BLE transport — local control over Bluetooth."""
+"""
+Tuya BLE transport — local control over Bluetooth.
+
+Protocol reference: ha_tuya_ble (PlusPlus-ua/ha_tuya_ble on GitHub).
+This implementation follows the same packet format, key derivation, and
+authentication sequence used by that integration.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import struct
+import time
 import weakref
 from hashlib import md5
+from typing import Any
 
 from bleak import BleakClient
 from bleak.exc import BleakError
-
-from .cipher import AESCipher
+from Crypto.Cipher import AES
 
 _LOGGER = logging.getLogger(__name__)
 
 # ── GATT UUIDs ────────────────────────────────────────────────────────────────
-# Newer Tuya BLE-only devices (service 1910, confirmed on BLE smart plug)
 TUYA_BLE_SERVICE_UUID = "00001910-0000-1000-8000-00805f9b34fb"
 TUYA_BLE_WRITE_UUID   = "00002b11-0000-1000-8000-00805f9b34fb"
 TUYA_BLE_NOTIFY_UUID  = "00002b10-0000-1000-8000-00805f9b34fb"
-# Older provisioning profile (WiFi+BLE combo devices)
-TUYA_BLE_SERVICE_UUID_LEGACY = "0000fd50-0000-1000-8000-00805f9b34fb"
-TUYA_BLE_WRITE_UUID_LEGACY   = "00000001-0000-1000-8000-00805f9b34fb"
-TUYA_BLE_NOTIFY_UUID_LEGACY  = "00000002-0000-1000-8000-00805f9b34fb"
 
-# ── BLE commands ──────────────────────────────────────────────────────────────
+# ── Command codes ─────────────────────────────────────────────────────────────
 class BLECmd:
-    DEVICE_INFO        = 0x00
-    PAIR               = 0x01
-    ACTIVE             = 0x02
-    SESS_KEY_NEG_START = 0x03
-    SESS_KEY_NEG_RES   = 0x04
-    SESS_KEY_NEG_FINISH= 0x05
-    HEARTBEAT          = 0x06
-    DP_QUERY           = 0x0e
-    DP_SEND            = 0x1b
-    DP_REPORT          = 0x22
-    DP_REPORT_V2       = 0x25
+    DEVICE_INFO   = 0x0000   # request / response
+    PAIR          = 0x0001   # request / response
+    DPS           = 0x0002   # send DP values to device
+    DEVICE_STATUS = 0x0003   # request current DP state
+    DP_REPORT     = 0x8001   # unsolicited DP push from device
+    DP_REPORT_T   = 0x8003   # DP push with timestamp
+    DP_REPORT_S   = 0x8004   # DP push signed
+    DP_REPORT_ST  = 0x8005   # DP push signed + timestamp
+    TIME1_REQ     = 0x8011   # device asking for Unix-ms timestamp
+    TIME2_REQ     = 0x8012   # device asking for struct-time
 
-# ── DP types ──────────────────────────────────────────────────────────────────
-_DP_BOOL   = 0x01
-_DP_ENUM   = 0x02
-_DP_INT    = 0x03
-_DP_STR    = 0x04
-_DP_BITMAP = 0x05
-_DP_RAW    = 0x06
+# ── DP types (BLE encoding — different from WiFi protocol) ────────────────────
+_DPT_RAW    = 0
+_DPT_BOOL   = 1
+_DPT_INT    = 2
+_DPT_STR    = 3
+_DPT_ENUM   = 4
+_DPT_BITMAP = 5
 
-# ── Packet constants ──────────────────────────────────────────────────────────
-_HEAD = b'\x55\xaa'
-_TAIL = b'\xaa\x55'
-# Packet layout (after _HEAD):
-#   version:1  seq:4  cmd:1  data_len:2  → 8 bytes
-_HDR_FMT = '>BIBH'   # big-endian: uchar, uint32, uchar, uint16
-_HDR_LEN = struct.calcsize(_HDR_FMT)   # == 8
-_OVERHEAD = len(_HEAD) + _HDR_LEN + 1 + len(_TAIL)  # 13 bytes total overhead
-_BLE_MTU  = 20  # conservative; renegotiated after connect
-
-TIMEOUT_CMD       = 10.0   # seconds to wait for a command response
-HEARTBEAT_INTERVAL = 10.0  # seconds between heartbeats
+TIMEOUT_CMD       = 12.0
+HEARTBEAT_INTERVAL = 30.0
+GATT_MTU          = 20
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _checksum(data: bytes) -> int:
-    """Simple sum-mod-256 checksum used by Tuya BLE."""
-    return sum(data) & 0xFF
+def _crc16(data: bytes) -> int:
+    """CRC-16 MODBUS."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b & 0xFF
+        for _ in range(8):
+            tmp = crc & 1
+            crc >>= 1
+            if tmp:
+                crc ^= 0xA001
+    return crc
 
 
-def _pack(version: int, seq: int, cmd: int, payload: bytes) -> bytes:
-    """Assemble a Tuya BLE packet (payload must already be encrypted)."""
-    hdr = _HEAD + struct.pack(_HDR_FMT, version, seq, cmd, len(payload))
-    body = hdr + payload
-    return body + struct.pack('B', _checksum(body)) + _TAIL
+def _pack_varint(value: int) -> bytes:
+    """LEB128 variable-length integer (used for BLE packet framing)."""
+    result = bytearray()
+    while True:
+        curr = value & 0x7F
+        value >>= 7
+        if value:
+            curr |= 0x80
+        result.append(curr)
+        if not value:
+            break
+    return bytes(result)
 
 
-def _unpack(raw: bytes):
-    """Parse a complete Tuya BLE packet.
+def _unpack_varint(data: bytes, pos: int) -> tuple[int, int]:
+    result = 0
+    for offset in range(5):
+        b = data[pos + offset]
+        result |= (b & 0x7F) << (offset * 7)
+        if not (b & 0x80):
+            return result, pos + offset + 1
+    raise ValueError("varint overflow")
 
-    Returns (version, seq, cmd, payload) or raises ValueError.
+
+def _build_packets(
+    seq: int,
+    code: int,
+    payload: bytes,
+    key: bytes,
+    response_to: int = 0,
+    security_flag: int = 0x05,
+    protocol_version: int = 3,
+) -> list[bytes]:
     """
-    if len(raw) < _OVERHEAD:
-        raise ValueError("packet too short")
-    if raw[:2] != _HEAD or raw[-2:] != _TAIL:
-        raise ValueError(f"bad framing: {raw[:2].hex()} / {raw[-2:].hex()}")
+    Build one or more MTU-sized BLE chunks for a Tuya BLE command.
 
-    version, seq, cmd, data_len = struct.unpack(_HDR_FMT, raw[2:2 + _HDR_LEN])
+    Wire format per chunk:
+      [packet_num: varint]
+      [if first: total_encrypted_len: varint + protocol_version_nibble: 1B]
+      [data_bytes up to MTU]
 
-    expected_len = _OVERHEAD + data_len
-    if len(raw) < expected_len:
-        raise ValueError("truncated packet")
+    Encrypted blob:
+      security_flag(1) + IV(16) + AES-CBC(key, IV, padded_raw)
 
-    payload  = raw[2 + _HDR_LEN : 2 + _HDR_LEN + data_len]
-    crc_byte = raw[2 + _HDR_LEN + data_len]
-    body     = raw[:2 + _HDR_LEN + data_len]
+    Raw (pre-encryption):
+      seq(4) + response_to(4) + code(2) + data_len(2) + payload + CRC16(2) + padding
+    """
+    iv = secrets.token_bytes(16)
 
-    if crc_byte != _checksum(body):
-        _LOGGER.debug("BLE checksum mismatch (got %02x, expected %02x)", crc_byte, _checksum(body))
+    raw = bytearray()
+    raw += struct.pack(">IIHH", seq, response_to, code, len(payload))
+    raw += payload
+    raw += struct.pack(">H", _crc16(raw))
+    while len(raw) % 16:
+        raw += b"\x00"
 
-    return version, seq, cmd, payload
+    cipher    = AES.new(key, AES.MODE_CBC, iv)
+    encrypted = bytes([security_flag]) + iv + cipher.encrypt(bytes(raw))
+
+    packets   = []
+    pkt_num   = 0
+    pos       = 0
+    total_len = len(encrypted)
+
+    while pos < total_len:
+        hdr = _pack_varint(pkt_num)
+        if pkt_num == 0:
+            hdr += _pack_varint(total_len)
+            hdr += bytes([protocol_version << 4])
+        chunk = encrypted[pos : pos + GATT_MTU - len(hdr)]
+        packets.append(bytes(hdr) + chunk)
+        pos     += len(chunk)
+        pkt_num += 1
+
+    return packets
+
+
+def _parse_packet(raw_encrypted: bytes, key: bytes) -> tuple[int, int, int, bytes]:
+    """
+    Decrypt and parse a reassembled Tuya BLE blob.
+    Returns (seq_num, response_to, code, payload).
+    """
+    iv         = raw_encrypted[1:17]
+    ciphertext = raw_encrypted[17:]
+    cipher     = AES.new(key, AES.MODE_CBC, iv)
+    raw        = cipher.decrypt(ciphertext)
+
+    seq_num, response_to, code, data_len = struct.unpack(">IIHH", raw[:12])
+    return seq_num, response_to, code, raw[12 : 12 + data_len]
 
 
 def _encode_dps(dps: dict) -> bytes:
-    """Encode {dp_id: value} → Tuya BLE binary DP stream."""
+    """Encode {dp_id: value} → Tuya BLE DP stream (3-byte header per DP)."""
     out = bytearray()
     for dp_id, value in dps.items():
         dp_id = int(dp_id)
         if isinstance(value, bool):
-            out += struct.pack('>BBH', dp_id, _DP_BOOL, 1) + struct.pack('B', int(value))
+            out += struct.pack(">BBB", dp_id, _DPT_BOOL, 1)
+            out += struct.pack("B", int(value))
         elif isinstance(value, int):
-            out += struct.pack('>BBH', dp_id, _DP_INT, 4) + struct.pack('>i', value)
+            out += struct.pack(">BBB", dp_id, _DPT_INT, 4)
+            out += struct.pack(">i", value)
         elif isinstance(value, str):
-            enc = value.encode('utf-8')
-            out += struct.pack('>BBH', dp_id, _DP_STR, len(enc)) + enc
+            enc = value.encode("utf-8")
+            out += struct.pack(">BBB", dp_id, _DPT_STR, len(enc))
+            out += enc
         elif isinstance(value, (bytes, bytearray)):
-            out += struct.pack('>BBH', dp_id, _DP_RAW, len(value)) + bytes(value)
+            out += struct.pack(">BBB", dp_id, _DPT_RAW, len(value))
+            out += bytes(value)
     return bytes(out)
 
 
-def _decode_dps(data: bytes) -> dict:
-    """Decode Tuya BLE binary DP stream → {dp_id_str: value}."""
+def _decode_dps(data: bytes) -> dict[str, Any]:
+    """Decode Tuya BLE DP stream → {dp_id_str: value}."""
     result = {}
-    i = 0
-    while i + 4 <= len(data):
-        dp_id, dp_type, dp_len = struct.unpack('>BBH', data[i:i + 4])
-        i += 4
-        if i + dp_len > len(data):
+    pos    = 0
+    while pos + 3 <= len(data):
+        dp_id   = data[pos]
+        dp_type = data[pos + 1]
+        dp_len  = data[pos + 2]
+        pos    += 3
+        if pos + dp_len > len(data):
             break
-        raw = data[i:i + dp_len]
-        i += dp_len
-        if dp_type == _DP_BOOL:
+        raw = data[pos : pos + dp_len]
+        pos += dp_len
+
+        if dp_type == _DPT_BOOL:
             result[str(dp_id)] = bool(raw[0])
-        elif dp_type in (_DP_ENUM, ):
+        elif dp_type == _DPT_INT:
+            result[str(dp_id)] = struct.unpack(">i", raw)[0] if len(raw) == 4 else int.from_bytes(raw, "big", signed=True)
+        elif dp_type == _DPT_ENUM:
             result[str(dp_id)] = raw[0]
-        elif dp_type == _DP_INT:
-            result[str(dp_id)] = struct.unpack('>i', raw)[0]
-        elif dp_type == _DP_BITMAP:
-            result[str(dp_id)] = struct.unpack('>I', raw)[0]
-        elif dp_type in (_DP_STR, _DP_RAW):
+        elif dp_type == _DPT_BITMAP:
+            result[str(dp_id)] = int.from_bytes(raw, "big")
+        elif dp_type in (_DPT_STR, _DPT_RAW):
             try:
-                result[str(dp_id)] = raw.decode('utf-8')
+                result[str(dp_id)] = raw.decode("utf-8")
             except UnicodeDecodeError:
                 result[str(dp_id)] = raw.hex()
     return result
 
 
+# ── Reassembler ───────────────────────────────────────────────────────────────
+
+class _Reassembler:
+    """Accumulates MTU-sized BLE notification chunks into complete packets."""
+
+    def __init__(self, callback):
+        self._buf      = bytearray()
+        self._expected_len = 0
+        self._expected_pkt = 0
+        self._callback = callback
+
+    def feed(self, data: bytes):
+        pos = 0
+        pkt_num, pos = _unpack_varint(data, pos)
+
+        if pkt_num != self._expected_pkt:
+            self._buf          = bytearray()
+            self._expected_len = 0
+            self._expected_pkt = 0
+            if pkt_num != 0:
+                return  # discard out-of-order
+
+        if pkt_num == 0:
+            self._buf = bytearray()
+            self._expected_len, pos = _unpack_varint(data, pos)
+            pos += 1  # skip protocol_version nibble
+
+        self._buf += data[pos:]
+        self._expected_pkt += 1
+
+        if len(self._buf) >= self._expected_len:
+            complete = bytes(self._buf[: self._expected_len])
+            self._buf          = bytearray()
+            self._expected_len = 0
+            self._expected_pkt = 0
+            self._callback(complete)
+
+
 # ── Main class ────────────────────────────────────────────────────────────────
 
 class TuyaBLEProtocol:
-    """BLE transport that matches the TuyaProtocol interface used by TuyaDevice."""
+    """
+    BLE transport that matches the TuyaProtocol interface used by TuyaDevice.
+
+    Authentication sequence (executed on every connect):
+      1. Send DEVICE_INFO (encrypted with login_key = MD5(local_key[:6]))
+      2. Receive DEVICE_INFO response → extract srand, derive session_key
+      3. Send PAIR (encrypted with session_key) with uuid+local_key[:6]+device_id
+      4. Receive PAIR response (result 0=success, 2=already_paired)
+      5. Normal operation: DEVICE_STATUS / DPS commands
+
+    The device may send TIME1_REQ / TIME2_REQ at any time — we respond inline.
+    """
 
     def __init__(
         self,
         mac_address: str,
         dev_id: str,
         local_key: str,
+        device_uuid: str,
         protocol_version: float,
         listener,
     ):
-        self.mac_address   = mac_address
-        self.id            = dev_id
-        self.local_key     = local_key
+        self.mac_address      = mac_address
+        self.id               = dev_id
+        self.local_key        = local_key
+        self.device_uuid      = device_uuid
         self.protocol_version = protocol_version
 
-        # BLE key = MD5(local_key) — different from the raw local_key used over TCP
-        ble_key = md5(local_key.encode('utf-8')).digest()
-        self._cipher = AESCipher(ble_key)
+        # Key derivation
+        self._lk6        = local_key[:6].encode("utf-8")
+        self._login_key  = md5(self._lk6).digest()
+        self._session_key: bytes | None = None
+        self._proto_ver  = 3  # updated from DEVICE_INFO response
 
-        self._listener     = weakref.ref(listener)
-        self._write_uuid   = TUYA_BLE_WRITE_UUID
-        self._notify_uuid  = TUYA_BLE_NOTIFY_UUID
+        self._listener    = weakref.ref(listener)
         self._client: BleakClient | None = None
-        self._seqno        = 1
-        self._connected    = False
-        self._recv_buf     = bytearray()
+        self._seqno       = 1
+        self._connected   = False
+        self._reassembler = _Reassembler(self._on_packet)
         self._pending: dict[int, asyncio.Future] = {}
         self._heartbeat_task: asyncio.Task | None = None
-        self._debug        = False
-        self._name         = dev_id
+        self._debug  = False
+        self._name   = dev_id
+
         self.dps_to_request: dict = {}
         self.dispatched_dps: dict = {}
 
@@ -200,22 +318,19 @@ class TuyaBLEProtocol:
                 self.dps_to_request[str(dp)] = None
 
     def keep_alive(self, is_gateway: bool = False):
-        """No-op — heartbeat is managed internally."""
+        pass  # heartbeat managed internally
 
     async def status(self, cid=None) -> dict:
-        """Query all DPs and return status dict."""
-        _, payload = await self._send(BLECmd.DP_QUERY, b'')
-        dps = _decode_dps(payload)
+        _, payload = await self._send(BLECmd.DEVICE_STATUS, b"")
+        dps = _decode_dps(payload) if payload else {}
         self.dispatched_dps = dps
         return dps
 
     async def set_dps(self, dps: dict, cid=None):
-        """Write DP values to device."""
-        await self._send(BLECmd.DP_SEND, _encode_dps(dps))
+        await self._send(BLECmd.DPS, _encode_dps(dps))
         self.dispatched_dps = dps
 
     async def update_dps(self, dps=None, cid=None):
-        """Request a status refresh."""
         try:
             status = await self.status()
             if status and (listener := self._listener()):
@@ -224,11 +339,9 @@ class TuyaBLEProtocol:
             _LOGGER.debug("[%s] update_dps: %s", self._name, exc)
 
     async def reset(self, dpIds=None, cid=None):
-        """Reset — BLE has no reset concept; just refresh status."""
         await self.update_dps()
 
     async def close(self):
-        """Disconnect from the BLE device."""
         self._connected = False
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
@@ -247,41 +360,20 @@ class TuyaBLEProtocol:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _do_connect(self):
-        """Open BLE connection, auto-detect UUID profile, start notify + heartbeat."""
         self._client = BleakClient(
             self.mac_address,
             disconnected_callback=self._on_disconnect,
         )
         await self._client.connect()
+        await self._client.start_notify(TUYA_BLE_NOTIFY_UUID, self._on_notify)
 
-        try:
-            _LOGGER.debug("[%s] BLE MTU = %d", self._name, self._client.mtu_size)
-        except AttributeError:
-            pass
+        await self._auth()
 
-        # Auto-detect which GATT profile this device uses
-        service_uuids = [str(s.uuid) for s in self._client.services]
-        if TUYA_BLE_SERVICE_UUID in service_uuids:
-            self._write_uuid  = TUYA_BLE_WRITE_UUID
-            self._notify_uuid = TUYA_BLE_NOTIFY_UUID
-            _LOGGER.debug("[%s] Using Tuya BLE profile 1910", self._name)
-        elif TUYA_BLE_SERVICE_UUID_LEGACY in service_uuids:
-            self._write_uuid  = TUYA_BLE_WRITE_UUID_LEGACY
-            self._notify_uuid = TUYA_BLE_NOTIFY_UUID_LEGACY
-            _LOGGER.debug("[%s] Using Tuya BLE legacy profile fd50", self._name)
-        else:
-            raise ConnectionError(
-                f"No Tuya BLE service found on {self.mac_address}. "
-                f"Available: {service_uuids}"
-            )
-
-        await self._client.start_notify(self._notify_uuid, self._on_notify)
-        self._connected = True
+        self._connected      = True
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        _LOGGER.debug("[%s] BLE connected to %s", self._name, self.mac_address)
+        _LOGGER.debug("[%s] BLE connected and authenticated", self._name)
 
     def _on_disconnect(self, _client: BleakClient):
-        """Bleak disconnect callback — fires on unexpected drops."""
         _LOGGER.debug("[%s] BLE disconnected", self._name)
         self._connected = False
         if self._heartbeat_task:
@@ -294,90 +386,129 @@ class TuyaBLEProtocol:
             listener.disconnected("BLE connection lost")
 
     def _on_notify(self, _sender, data: bytearray):
-        """Accumulate incoming notification chunks and parse complete packets."""
-        self._recv_buf.extend(data)
-        self._drain_buffer()
+        self._reassembler.feed(bytes(data))
 
-    def _drain_buffer(self):
-        """Extract and handle every complete packet in _recv_buf."""
-        buf = self._recv_buf
-        while True:
-            # Scan for header
-            idx = bytes(buf).find(_HEAD)
-            if idx < 0:
-                buf.clear()
-                return
-            if idx:
-                del buf[:idx]
-
-            # Need at least the fixed header to know payload length
-            if len(buf) < 2 + _HDR_LEN:
-                return
-
-            _, _, _, data_len = struct.unpack(_HDR_FMT, buf[2:2 + _HDR_LEN])
-            total = _OVERHEAD + data_len
-            if len(buf) < total:
-                return  # wait for more chunks
-
-            raw = bytes(buf[:total])
-            del buf[:total]
-            self._dispatch(raw)
-
-    def _dispatch(self, raw: bytes):
-        """Handle one complete raw packet."""
-        try:
-            version, seq, cmd, payload = _unpack(raw)
-        except ValueError as exc:
-            _LOGGER.debug("[%s] bad packet: %s", self._name, exc)
+    def _on_packet(self, raw_encrypted: bytes):
+        """Called by _Reassembler when a complete encrypted blob is ready."""
+        security_flag = raw_encrypted[0]
+        key = self._get_key(security_flag)
+        if key is None:
+            _LOGGER.debug("[%s] BLE: no key for security_flag=0x%02x", self._name, security_flag)
             return
 
-        # Decrypt
-        if payload:
-            try:
-                payload = self._cipher.decrypt(payload, use_base64=False, decode_text=False)
-            except Exception as exc:
-                _LOGGER.debug("[%s] decrypt failed: %s", self._name, exc)
-                return
+        try:
+            seq, resp_to, code, payload = _parse_packet(raw_encrypted, key)
+        except Exception as exc:
+            _LOGGER.debug("[%s] BLE decrypt error: %s", self._name, exc)
+            return
 
         if self._debug:
-            _LOGGER.debug("[%s] BLE ← cmd=0x%02x seq=%d payload=%s", self._name, cmd, seq, payload.hex() if payload else '')
+            _LOGGER.debug(
+                "[%s] BLE ← seq=%d resp_to=%d code=0x%04x payload=%s",
+                self._name, seq, resp_to, code, payload.hex() if payload else "(empty)",
+            )
 
-        # Resolve a waiting send() call
-        if seq in self._pending:
-            fut = self._pending.pop(seq)
-            if not fut.done():
-                fut.set_result((cmd, payload))
+        # Time sync requests from device
+        if code == BLECmd.TIME1_REQ:
+            asyncio.create_task(self._send_time1(seq))
+            return
+        if code == BLECmd.TIME2_REQ:
+            asyncio.create_task(self._send_time2(seq))
             return
 
-        # Unsolicited push from device
-        if cmd in (BLECmd.DP_REPORT, BLECmd.DP_REPORT_V2):
+        # Resolve a waiting send()
+        if resp_to != 0 and resp_to in self._pending:
+            fut = self._pending.pop(resp_to)
+            if not fut.done():
+                fut.set_result((code, payload))
+            return
+
+        # Unsolicited DP push
+        if code in (BLECmd.DP_REPORT, BLECmd.DP_REPORT_T, BLECmd.DP_REPORT_S, BLECmd.DP_REPORT_ST):
             dps = _decode_dps(payload)
             if dps:
                 self.dispatched_dps = dps
                 if listener := self._listener():
                     listener.status_updated(dps)
+            # Acknowledge
+            asyncio.create_task(self._send_response(code, b"", seq))
 
-    async def _send(self, cmd: int, payload: bytes, timeout: float = TIMEOUT_CMD) -> tuple[int, bytes]:
-        """Encrypt, frame, send a command and await the response."""
-        if not self.is_connected:
-            raise ConnectionError("BLE not connected")
+    def _get_key(self, security_flag: int) -> bytes | None:
+        if security_flag == 0x04:
+            return self._login_key
+        if security_flag == 0x05:
+            return self._session_key
+        if security_flag == 0x01:
+            return None  # auth_key (not used for control)
+        return None
 
-        seq = self._seqno
+    async def _auth(self):
+        """Full DEVICE_INFO → PAIR authentication sequence."""
+        # DEVICE_INFO
+        _, payload = await self._raw_send(
+            BLECmd.DEVICE_INFO, b"", self._login_key,
+            security_flag=0x04, timeout=15.0,
+        )
+        if len(payload) < 46:
+            raise ConnectionError("DEVICE_INFO response too short")
+
+        self._proto_ver = payload[2]
+        srand           = payload[6:12]
+        self._session_key = md5(self._lk6 + srand).digest()
+        _LOGGER.debug(
+            "[%s] BLE auth: proto=%d srand=%s session_key=%s",
+            self._name, self._proto_ver, srand.hex(), self._session_key.hex(),
+        )
+
+        # PAIR
+        pair_data = bytearray()
+        pair_data += self.device_uuid.encode("utf-8")
+        pair_data += self._lk6
+        pair_data += self.id.encode("utf-8")
+        while len(pair_data) < 44:
+            pair_data += b"\x00"
+
+        _, pair_payload = await self._raw_send(
+            BLECmd.PAIR, bytes(pair_data), self._session_key,
+            security_flag=0x05, timeout=15.0,
+        )
+        result = pair_payload[0] if pair_payload else 255
+        if result not in (0, 2):
+            raise ConnectionError(f"PAIR failed: result={result}")
+        _LOGGER.debug("[%s] BLE auth: PAIR result=%d (paired)", self._name, result)
+
+    async def _raw_send(
+        self,
+        code: int,
+        payload: bytes,
+        key: bytes,
+        security_flag: int = 0x05,
+        response_to: int = 0,
+        timeout: float = TIMEOUT_CMD,
+    ) -> tuple[int, bytes]:
+        """Low-level send: encrypts, chunks, writes, awaits response."""
+        seq  = self._seqno
         self._seqno += 1
-
-        encrypted = self._cipher.encrypt(payload, use_base64=False, pad=True) if payload else b''
-        packet    = _pack(int(self.protocol_version), seq, cmd, encrypted)
 
         loop = asyncio.get_running_loop()
         fut  = loop.create_future()
         self._pending[seq] = fut
 
-        mtu = getattr(self._client, 'mtu_size', _BLE_MTU) or _BLE_MTU
-        for i in range(0, len(packet), mtu):
-            await self._client.write_gatt_char(self._write_uuid, packet[i:i + mtu], response=False)
+        packets = _build_packets(
+            seq, code, payload, key,
+            response_to=response_to,
+            security_flag=security_flag,
+            protocol_version=self._proto_ver,
+        )
 
         if self._debug:
-            _LOGGER.debug("[%s] BLE → cmd=0x%02x seq=%d payload=%s", self._name, cmd, seq, payload.hex() if payload else '')
+            _LOGGER.debug(
+                "[%s] BLE → seq=%d code=0x%04x payload=%s",
+                self._name, seq, code, payload.hex() if payload else "(empty)",
+            )
+
+        for pkt in packets:
+            await self._client.write_gatt_char(TUYA_BLE_WRITE_UUID, pkt, response=True)
 
         try:
             async with asyncio.timeout(timeout):
@@ -386,32 +517,78 @@ class TuyaBLEProtocol:
             self._pending.pop(seq, None)
             raise
 
+    async def _send(self, code: int, payload: bytes, timeout: float = TIMEOUT_CMD) -> tuple[int, bytes]:
+        """Authenticated send using session_key."""
+        if not self.is_connected or self._session_key is None:
+            raise ConnectionError("BLE not connected / not authenticated")
+        return await self._raw_send(code, payload, self._session_key, timeout=timeout)
+
+    async def _send_response(self, code: int, payload: bytes, response_to: int):
+        """Send a response to a device-initiated message (e.g. time request)."""
+        if not self._client or not self._client.is_connected or self._session_key is None:
+            return
+        seq  = self._seqno
+        self._seqno += 1
+        packets = _build_packets(
+            seq, code, payload, self._session_key,
+            response_to=response_to,
+            security_flag=0x05,
+            protocol_version=self._proto_ver,
+        )
+        for pkt in packets:
+            try:
+                await self._client.write_gatt_char(TUYA_BLE_WRITE_UUID, pkt, response=False)
+            except Exception:
+                pass
+
+    async def _send_time1(self, device_seq: int):
+        ts_ms = int(time.time() * 1000)
+        tz    = -int(__import__("time").timezone // 36)
+        await self._send_response(
+            BLECmd.TIME1_REQ,
+            str(ts_ms).encode() + struct.pack(">h", tz),
+            device_seq,
+        )
+
+    async def _send_time2(self, device_seq: int):
+        t  = __import__("time").localtime()
+        tz = -int(__import__("time").timezone // 36)
+        data = struct.pack(
+            ">BBBBBBBh",
+            t.tm_year % 100, t.tm_mon, t.tm_mday,
+            t.tm_hour, t.tm_min, t.tm_sec,
+            t.tm_wday, tz,
+        )
+        await self._send_response(BLECmd.TIME2_REQ, data, device_seq)
+
     async def _heartbeat_loop(self):
         while self._connected:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
-                await self._send(BLECmd.HEARTBEAT, b'', timeout=5.0)
+                await self._send(BLECmd.DEVICE_STATUS, b"", timeout=8.0)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 _LOGGER.debug("[%s] heartbeat: %s", self._name, exc)
 
 
-# ── Factory (mirrors pytuya.connect) ─────────────────────────────────────────
+# ── Factory ───────────────────────────────────────────────────────────────────
 
 async def connect_ble(
     mac_address: str,
     device_id: str,
+    device_uuid: str,
     local_key: str,
     protocol_version: float,
     enable_debug: bool,
     listener,
 ) -> TuyaBLEProtocol:
-    """Connect to a Tuya BLE device and return a ready TuyaBLEProtocol."""
+    """Connect to a Tuya BLE device and return a ready, authenticated TuyaBLEProtocol."""
     proto = TuyaBLEProtocol(
         mac_address=mac_address,
         dev_id=device_id,
         local_key=local_key,
+        device_uuid=device_uuid,
         protocol_version=protocol_version,
         listener=listener,
     )

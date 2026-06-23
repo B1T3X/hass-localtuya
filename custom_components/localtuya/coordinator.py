@@ -209,6 +209,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     self._interface = await pytuya_ble_connect(
                         self._device_config.ble_mac,
                         self._device_config.id,
+                        self._device_config.tuya_uuid or "",
                         self.local_key,
                         float(self._device_config.protocol_version),
                         self._device_config.enable_debug,
