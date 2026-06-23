@@ -28,6 +28,7 @@ from .core.pytuya import (
     TuyaProtocol,
     connect as pytuya_connect,
 )
+from .core.pytuya.ble import connect_ble as pytuya_ble_connect
 from .core.pytuya.parser import DecodeError
 
 from .const import (
@@ -204,6 +205,18 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                         break
                     if self._device_config.enable_debug:
                         self._interface.enable_debug(True, gateway.friendly_name)
+                elif self._device_config.ble_mac:
+                    self._interface = await pytuya_ble_connect(
+                        self._device_config.ble_mac,
+                        self._device_config.id,
+                        self.local_key,
+                        float(self._device_config.protocol_version),
+                        self._device_config.enable_debug,
+                        self,
+                    )
+                    self._interface.enable_debug(
+                        self._device_config.enable_debug, self.friendly_name
+                    )
                 else:
                     self._interface = await pytuya_connect(
                         self._device_config.host,
